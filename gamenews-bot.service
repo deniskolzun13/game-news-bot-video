@@ -1,0 +1,15 @@
+[Unit]
+Description=Game news Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/koldun/мее
+ExecStart=/home/koldun/мее/.venv/bin/python -u bot.py
+Environment=AIOHTTP_CLIENT_FORCE_IPV4=1
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
