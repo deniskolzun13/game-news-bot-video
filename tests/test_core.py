@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from config import Config
+from llm_ollama import OllamaClient
 from pipeline import NewsPipeline
 from storage import Storage, normalize_title
 
@@ -106,6 +107,40 @@ class _Publisher:
 
     async def close(self):
         pass
+
+
+class OllamaClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ollama_semaphore_limits_concurrency(self):
+        """OLLAMA_CONCURRENCY=1: запросы к Ollama не выполняются параллельно,
+        даже если сетевой семафор позволяет больше."""
+        import httpx
+
+        class _FakeTransport(httpx.AsyncBaseTransport):
+            def __init__(self):
+                self.concurrent = 0
+                self.max_concurrent = 0
+
+            async def handle_async_request(self, request):
+                self.concurrent += 1
+                self.max_concurrent = max(self.max_concurrent, self.concurrent)
+                await asyncio.sleep(0.05)
+                self.concurrent -= 1
+                return httpx.Response(200, json={"response": "текст"})
+
+        transport = _FakeTransport()
+        client = OllamaClient(
+            "http://ollama.test", "model", "fallback", timeout=5, concurrency=1
+        )
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(transport=transport, timeout=5)
+        try:
+            await asyncio.gather(*[
+                client.rewrite("model", f"Заголовок {i}", "статья")
+                for i in range(6)
+            ])
+            self.assertEqual(transport.max_concurrent, 1)
+        finally:
+            await client.close()
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):

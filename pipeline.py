@@ -120,7 +120,8 @@ class NewsPipeline:
         self._storage = Storage(cfg.db_path)
         self._http = httpx.AsyncClient(timeout=cfg.http_timeout)
         self._ollama = OllamaClient(
-            cfg.ollama_base_url, cfg.ollama_model, cfg.ollama_fallback_model
+            cfg.ollama_base_url, cfg.ollama_model, cfg.ollama_fallback_model,
+            concurrency=cfg.ollama_concurrency,
         )
         self._publisher = (
             None
@@ -206,6 +207,9 @@ class NewsPipeline:
                     slot = self._next_slot(max(slot, now))
                     tasks.append((item, slot))
 
+                # Семафор только для сетевой работы (статьи/фото/видео).
+                # Запросы к Ollama ограничены отдельно: OLLAMA_CONCURRENCY
+                # (локальная LLM почти последовательна, см. OllamaClient).
                 sem = asyncio.Semaphore(3)
 
                 async def _handle(item, slot):

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import httpx
@@ -72,12 +73,18 @@ class OllamaModelMissing(OllamaError):
 
 
 class OllamaClient:
-    def __init__(self, base_url: str, model: str, fallback_model: str, timeout: float = 120.0):
+    def __init__(self, base_url: str, model: str, fallback_model: str,
+                 timeout: float = 120.0, concurrency: int = 2):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.fallback_model = fallback_model
         self.timeout = timeout
         self._client = httpx.AsyncClient(timeout=timeout)
+        # Отдельный от сетевого параллелизма семафор: локальная LLM обрабатывает
+        # генерации практически последовательно (одна GPU/CPU-инференс-очередь),
+        # поэтому лимит не поднимаем до сетевого уровня, иначе запросы к Ollama
+        # просто копятся у неё в очереди, пока сеть уже свободна.
+        self._sem = asyncio.Semaphore(max(1, concurrency))
 
     async def check(self) -> str:
         """Проверяет, что ollama serve запущен и нужная модель скачана.
@@ -127,17 +134,18 @@ class OllamaClient:
             "temperature": 0.7,
             "options": {"num_ctx": 8192},
         }
-        try:
-            resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
+        async with self._sem:
+            try:
+                resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
 
-        text = (resp.json().get("response") or "").strip()
-        text = text.strip('"').strip("«»").strip()
-        if not text:
-            raise OllamaError("Ollama вернул пустой ответ")
-        return text
+            text = (resp.json().get("response") or "").strip()
+            text = text.strip('"').strip("«»").strip()
+            if not text:
+                raise OllamaError("Ollama вернул пустой ответ")
+            return text
 
     async def extract_game(self, model: str, title: str) -> str | None:
         """Выделяет название игры из заголовка через LLM.
@@ -152,17 +160,18 @@ class OllamaClient:
             "temperature": 0.0,
             "options": {"num_ctx": 2048},
         }
-        try:
-            resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
+        async with self._sem:
+            try:
+                resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
 
-        name = (resp.json().get("response") or "").strip()
-        name = name.strip('"').strip("«»").strip()
-        if not name or name.lower() in ("нет", "no", "none", "-", "нет игры"):
-            return None
-        return name
+            name = (resp.json().get("response") or "").strip()
+            name = name.strip('"').strip("«»").strip()
+            if not name or name.lower() in ("нет", "no", "none", "-", "нет игры"):
+                return None
+            return name
 
     async def is_same_news(self, model: str, title_a: str, title_b: str) -> bool:
         """Одна и та же новость в двух заголовках? (LLM, ответ «да»/«нет»)."""
@@ -174,12 +183,13 @@ class OllamaClient:
             "temperature": 0.0,
             "options": {"num_ctx": 2048},
         }
-        try:
-            resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
-        return (resp.json().get("response") or "").strip().lower().startswith("да")
+        async with self._sem:
+            try:
+                resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
+            return (resp.json().get("response") or "").strip().lower().startswith("да")
 
     async def proofread(self, model: str, text: str) -> str:
         """Вычитка поста: исправляет орфографию/грамматику без правки содержания."""
@@ -191,17 +201,18 @@ class OllamaClient:
             "temperature": 0.0,
             "options": {"num_ctx": 4096},
         }
-        try:
-            resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
+        async with self._sem:
+            try:
+                resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
 
-        fixed = (resp.json().get("response") or "").strip()
-        fixed = fixed.strip('"').strip("«»").strip()
-        if not fixed:
-            raise OllamaError("Ollama вернул пустой ответ на вычитку")
-        return fixed
+            fixed = (resp.json().get("response") or "").strip()
+            fixed = fixed.strip('"').strip("«»").strip()
+            if not fixed:
+                raise OllamaError("Ollama вернул пустой ответ на вычитку")
+            return fixed
 
     async def close(self) -> None:
         await self._client.aclose()

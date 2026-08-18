@@ -24,6 +24,7 @@ class Config:
     max_video_size_mb: int = 50
     enable_video_posts: bool = False
     ytdlp_enabled: bool = True
+    ollama_concurrency: int = 2
     ytdlp_max_mb: int = 150
     ytdlp_height: int = 720
     ytdlp_timeout: int = 300
@@ -117,6 +118,7 @@ def load_config(dry_run: bool = False) -> Config:
         max_video_size_mb=_env_int("MAX_VIDEO_SIZE_MB", 50),
         enable_video_posts=_env_bool("ENABLE_VIDEO_POSTS", False),
         ytdlp_enabled=_env_bool("YTDLP_ENABLED", True),
+        ollama_concurrency=_env_int("OLLAMA_CONCURRENCY", 2),
         ytdlp_max_mb=_env_int("YTDLP_MAX_MB", 150),
         ytdlp_height=_env_int("YTDLP_HEIGHT", 720),
         ytdlp_timeout=_env_int("YTDLP_TIMEOUT", 300),
