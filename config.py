@@ -22,6 +22,7 @@ class Config:
     min_image_width: int = 1024
     max_caption_length: int = 1024
     max_video_size_mb: int = 50
+    enable_video_posts: bool = False
     ytdlp_enabled: bool = True
     ytdlp_max_mb: int = 150
     ytdlp_height: int = 720
@@ -114,6 +115,7 @@ def load_config(dry_run: bool = False) -> Config:
         min_image_width=_env_int("MIN_IMAGE_WIDTH", 1024),
         max_caption_length=_env_int("MAX_CAPTION_LENGTH", 1024),
         max_video_size_mb=_env_int("MAX_VIDEO_SIZE_MB", 50),
+        enable_video_posts=_env_bool("ENABLE_VIDEO_POSTS", False),
         ytdlp_enabled=_env_bool("YTDLP_ENABLED", True),
         ytdlp_max_mb=_env_int("YTDLP_MAX_MB", 150),
         ytdlp_height=_env_int("YTDLP_HEIGHT", 720),

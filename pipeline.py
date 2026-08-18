@@ -8,6 +8,7 @@ import random
 import re
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
@@ -101,6 +102,15 @@ def _post_is_publishable(text: str) -> bool:
     if len(text.strip()) < 40 or "http://" in lowered or "https://" in lowered:
         return False
     return len([line for line in text.splitlines() if line.strip()]) >= 2
+
+
+@dataclass
+class Post:
+    """Готовый к публикации пост: текст, фото, видео, игра из заголовка."""
+    text: str
+    photos: list[bytes]
+    video: bytes | None = None
+    game: str | None = None
 
 
 class NewsPipeline:
@@ -221,13 +231,14 @@ class NewsPipeline:
                 )
         return results
 
-    async def _process_item(self, item: NewsItem, model: str, publish_at: datetime) -> bool:
-        if self._storage.is_published(item.url) or self._storage.is_queued(item.url):
-            log.debug("Уже публиковалось или в очереди: %s", item.url)
-            return False
+    async def _build_post(self, item: NewsItem, model: str) -> Post | None:
+        """Собирает готовый пост из новости: статья → игра → дубликат → LLM →
+        контроль качества → фото/видео → хэштег → упоминание канала → формат.
 
-        log.info("Новость: %s", item.title)
-
+        Общая цепочка для плановой (_process_item) и немедленной
+        (publish_one_now) публикации. Возвращает None, если новость не прошла
+        хотя бы один этап (тогда она не публикуется вообще).
+        """
         article = await fetch_article(
             self._http, item.url, item.source, self._cfg.http_timeout
         )
@@ -236,14 +247,14 @@ class NewsPipeline:
             article_text = item.description
         if not article_text:
             log.warning("Нет текста статьи, пропускаем: %s", item.url)
-            return False
+            return None
 
         game = await self._game_name(model, item.title)
         if await self._is_duplicate(item, model, game):
-            return False
+            return None
         if game and await self._is_recent_game(game):
             log.info("Игра %r недавно уже упоминалась — пропускаем: %s", game, item.url)
-            return False
+            return None
 
         text = await self._ollama.rewrite(model, item.title, article_text)
         try:
@@ -252,29 +263,45 @@ class NewsPipeline:
             log.warning("Проверка орфографии не сработала — публикуем пост как есть")
         if not _post_is_publishable(text):
             log.warning("Пост не прошёл контроль качества, пропускаем: %s", item.url)
-            return False
-        # Канал публикует только посты с чистой фотографией: видео и картинки
-        # из статьи не используем, чтобы не допустить водяные знаки.
+            return None
+
+        # Канал публикует только посты с чистой фотографией: картинки из
+        # статьи не используем, чтобы не допустить водяные знаки. Видео —
+        # только при ENABLE_VIDEO_POSTS=true (по умолчанию выключено).
         video = None
+        if self._cfg.enable_video_posts:
+            video = await self._pick_video(article)
         photos = await self._pick_photos(item, article, game)
         if not photos:
             log.info("Нет чистого фото — новость не ставим в очередь: %s", item.url)
-            return False
+            return None
+
         text = _ensure_hashtag(text, item.title, game)
         text = _add_channel_link(text, self._cfg.channel_id)
         text = _format_post(text)
+        return Post(text=text, photos=photos, video=video, game=game)
+
+    async def _process_item(self, item: NewsItem, model: str, publish_at: datetime) -> bool:
+        if self._storage.is_published(item.url) or self._storage.is_queued(item.url):
+            log.debug("Уже публиковалось или в очереди: %s", item.url)
+            return False
+
+        log.info("Новость: %s", item.title)
+        post = await self._build_post(item, model)
+        if post is None:
+            return False
 
         if self._publisher is None:
             log.info("[dry-run] Был бы запланирован пост на %s UTC (%d символов, фото: %d, видео: %s)",
-                     publish_at.strftime("%d.%m %H:%M"), len(text),
-                     len(photos), "есть" if video else "нет")
-            log.info("[dry-run] Текст:\n%s", text)
+                     publish_at.strftime("%d.%m %H:%M"), len(post.text),
+                     len(post.photos), "есть" if post.video else "нет")
+            log.info("[dry-run] Текст:\n%s", post.text)
             self._storage.mark_published(item.url, item.source, item.title)
         else:
             inserted = self._storage.enqueue(
-                item.url, item.source, item.title, text,
-                photos[0] if photos else None, publish_at, video,
-                extra_photos=self._extra_photos(photos),
+                item.url, item.source, item.title, post.text,
+                post.photos[0] if post.photos else None, publish_at, post.video,
+                extra_photos=self._extra_photos(post.photos),
                 created_at=item.published_at or datetime.now(timezone.utc),
             )
             if not inserted:
@@ -301,48 +328,17 @@ class NewsPipeline:
                 if self._storage.is_published(item.url) or self._storage.is_queued(item.url):
                     continue
                 try:
-                    article = await fetch_article(
-                        self._http, item.url, item.source, self._cfg.http_timeout
-                    )
-                    article_text = article.text if article else ""
-                    if not article_text:
-                        article_text = item.description
-                    if not article_text:
-                        log.warning("Нет текста статьи, пропускаем: %s", item.url)
+                    post = await self._build_post(item, model)
+                    if post is None:
                         continue
-
-                    game = await self._game_name(model, item.title)
-                    if await self._is_duplicate(item, model, game):
-                        continue
-                    if game and await self._is_recent_game(game):
-                        log.info("Игра %r недавно уже упоминалась — пропускаем: %s", game, item.url)
-                        continue
-
-                    text = await self._ollama.rewrite(model, item.title, article_text)
-                    try:
-                        text = await self._ollama.proofread(model, text)
-                    except OllamaError:
-                        log.warning("Проверка орфографии не сработала — публикуем пост как есть")
-                    if not _post_is_publishable(text):
-                        log.warning("Пост не прошёл контроль качества, пропускаем: %s", item.url)
-                        continue
-                    video = None
-                    photos = await self._pick_photos(item, article, game)
-                    if not photos:
-                        log.info("Нет чистого фото — новость не ставим в очередь: %s", item.url)
-                        continue
-                    text = _ensure_hashtag(text, item.title, game)
-                    text = _add_channel_link(text, self._cfg.channel_id)
-                    text = _format_post(text)
-
                     if self._publisher is None:
-                        log.info("[dry-run] Немедленная публикация:\n%s", text)
+                        log.info("[dry-run] Немедленная публикация:\n%s", post.text)
                     else:
                         inserted = self._storage.enqueue(
-                            item.url, item.source, item.title, text,
-                            photos[0] if photos else None,
-                            datetime.now(timezone.utc), video,
-                            extra_photos=self._extra_photos(photos),
+                            item.url, item.source, item.title, post.text,
+                            post.photos[0] if post.photos else None,
+                            datetime.now(timezone.utc), post.video,
+                            extra_photos=self._extra_photos(post.photos),
                             created_at=item.published_at or datetime.now(timezone.utc),
                         )
                         if not inserted:
