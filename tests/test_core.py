@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pipeline as pipeline_module
 from config import Config
 from llm_ollama import OllamaClient
 from pipeline import NewsPipeline
@@ -11,12 +12,12 @@ from storage import Storage, normalize_title
 
 
 class _NewsItem:
-    def __init__(self, url, source, title, description="Описание новости"):
+    def __init__(self, url, source, title, description="Описание новости", published_at=None):
         self.url = url
         self.source = source
         self.title = title
         self.description = description
-        self.published_at = datetime.now(timezone.utc)
+        self.published_at = published_at or datetime.now(timezone.utc)
 
 
 class _ParserWithItem:
@@ -33,6 +34,161 @@ class _ParserWithItem:
 class _FakeOllama:
     async def check(self):
         return "model"
+
+
+def _make_pipeline(cfg: Config) -> NewsPipeline:
+    """Pipeline без сети: задержка слота 0, слоты считаем детерминированно."""
+    pipeline = NewsPipeline(cfg)
+    pipeline._random_delay = lambda: timedelta(0)
+    return pipeline
+
+
+class PureFunctionTests(unittest.TestCase):
+    def test_ensure_hashtag_keeps_existing(self):
+        text = "Заголовок\n\nТекст новости\n\n#GTA6"
+        self.assertEqual(
+            pipeline_module._ensure_hashtag(text, "Заголовок", "GTA 6"),
+            text,
+        )
+
+    def test_ensure_hashtag_appends_game(self):
+        text = "Заголовок\n\nТекст новости"
+        result = pipeline_module._ensure_hashtag(text, "Заголовок", "GTA 6")
+        self.assertTrue(result.endswith("\n#GTA6"))
+
+    def test_ensure_hashtag_cleans_game_name(self):
+        text = "Заголовок\n\nТекст новости"
+        result = pipeline_module._ensure_hashtag(text, "Заголовок", "Apex: Legends 2!")
+        self.assertTrue(result.endswith("\n#ApexLegends2"))
+
+    def test_ensure_hashtag_fallback_to_game(self):
+        text = "Заголовок\n\nТекст новости"
+        result = pipeline_module._ensure_hashtag(text, "Глава The Blood of Dawnwalker обновил игру", "")
+        self.assertTrue(result.endswith("\n#ГлаваTheBloodofDawnwalker"))
+
+    def test_ensure_hashtag_fallback_игры(self):
+        text = "Заголовок\n\nТекст новости"
+        result = pipeline_module._ensure_hashtag(text, "всё в нижнем регистре без игры", "")
+        self.assertTrue(result.endswith("\n#Игры"))
+
+    def test_add_channel_link_requires_at(self):
+        text = "Заголовок\n\nТекст новости"
+        self.assertEqual(pipeline_module._add_channel_link(text, "parser04ko"), text)
+
+    def test_add_channel_link_before_hashtag(self):
+        text = "Заголовок\n\nТекст новости\n\n#GTA6"
+        result = pipeline_module._add_channel_link(text, "@parser04ko")
+        self.assertEqual(result, "Заголовок\n\nТекст новости\n\n\n@parser04ko\n#GTA6")
+
+    def test_add_channel_link_appends_without_hashtag(self):
+        text = "Заголовок\n\nТекст новости"
+        result = pipeline_module._add_channel_link(text, "@parser04ko")
+        self.assertEqual(result, "Заголовок\n\nТекст новости\n\n@parser04ko")
+
+    def test_format_post_bold_first_line_and_escape(self):
+        text = "A < B & C\n\nТекст новости"
+        result = pipeline_module._format_post(text)
+        self.assertEqual(result, "<b>A &lt; B &amp; C</b>\n\nТекст новости")
+
+    def test_post_is_publishable(self):
+        self.assertFalse(pipeline_module._post_is_publishable("Короткий текст"))
+        self.assertFalse(pipeline_module._post_is_publishable("Заголовок\n\nСсылка: https://example.com"))
+        self.assertFalse(pipeline_module._post_is_publishable("Одна строка, но достаточно длинная чтобы пройти минимальную проверку"))
+        self.assertTrue(pipeline_module._post_is_publishable("Заголовок новости\n\nСодержимое новости достаточно длинное для публикации."))
+
+    def test_news_priority(self):
+        now = datetime.now(timezone.utc)
+        fresh_announce = _NewsItem("https://example.test/a", "s", "Анонс новой игры",
+                                   published_at=now - timedelta(hours=1))
+        old_neutral = _NewsItem("https://example.test/b", "s", "Тестовая новость",
+                                published_at=now - timedelta(hours=48))
+        rumor = _NewsItem("https://example.test/c", "s", "Слух о новой игре",
+                          published_at=now - timedelta(hours=48))
+        self.assertGreater(
+            pipeline_module._news_priority(fresh_announce),
+            pipeline_module._news_priority(old_neutral),
+        )
+        self.assertGreater(
+            pipeline_module._news_priority(old_neutral),
+            pipeline_module._news_priority(rumor),
+        )
+
+
+class PipelineSlotTests(unittest.IsolatedAsyncioTestCase):
+    def _cfg(self, peak_hours):
+        with tempfile.TemporaryDirectory() as directory:
+            return Config(
+                "token", "@channel", db_path=str(Path(directory) / "bot.db"), dry_run=True,
+                min_post_delay_minutes=0, max_post_delay_minutes=0,
+                peak_hours=peak_hours, timezone="Europe/Moscow",
+            )
+
+    def _msk(self, iso: str) -> datetime:
+        return datetime.fromisoformat(iso).astimezone(timezone.utc)
+
+    async def test_next_slot_after_midnight(self):
+        """После полуночи (23:45 МСК) ближайший слот — 08:00 следующего дня."""
+        pipeline = _make_pipeline(self._cfg(list(range(8, 22))))
+        try:
+            slot = pipeline._next_slot(self._msk("2026-08-19T23:45:00+03:00"))
+            self.assertEqual(slot, self._msk("2026-08-20T08:00:00+03:00"))
+        finally:
+            await pipeline.close()
+
+    async def test_next_slot_new_day_after_peak(self):
+        """Поздний вечер после последнего слота — слот на следующий день."""
+        pipeline = _make_pipeline(self._cfg(list(range(8, 22))))
+        try:
+            slot = pipeline._next_slot(self._msk("2026-08-19T22:00:00+03:00"))
+            self.assertEqual(slot, self._msk("2026-08-20T08:00:00+03:00"))
+        finally:
+            await pipeline.close()
+
+    async def test_next_slot_after_exact_slot(self):
+        """Ровно в слоте: следующий слот строго позже (08:30, а не 08:00)."""
+        pipeline = _make_pipeline(self._cfg(list(range(8, 22))))
+        try:
+            slot = pipeline._next_slot(self._msk("2026-08-19T08:00:00+03:00"))
+            self.assertEqual(slot, self._msk("2026-08-19T08:30:00+03:00"))
+        finally:
+            await pipeline.close()
+
+    async def test_next_slot_single_peak_hour(self):
+        """Один час в пике: слоты 08:00 и 08:30, затем следующий день."""
+        pipeline = _make_pipeline(self._cfg([8]))
+        try:
+            self.assertEqual(
+                pipeline._next_slot(self._msk("2026-08-19T07:50:00+03:00")),
+                self._msk("2026-08-19T08:00:00+03:00"),
+            )
+            self.assertEqual(
+                pipeline._next_slot(self._msk("2026-08-19T08:20:00+03:00")),
+                self._msk("2026-08-19T08:30:00+03:00"),
+            )
+            self.assertEqual(
+                pipeline._next_slot(self._msk("2026-08-19T09:00:00+03:00")),
+                self._msk("2026-08-20T08:00:00+03:00"),
+            )
+        finally:
+            await pipeline.close()
+
+    async def test_next_slot_no_peak_hours(self):
+        pipeline = _make_pipeline(self._cfg([]))
+        try:
+            with self.assertRaises(RuntimeError):
+                pipeline._next_slot(self._msk("2026-08-19T12:00:00+03:00"))
+        finally:
+            await pipeline.close()
+
+    async def test_next_slot_consecutive_increase(self):
+        """Последовательные вызовы дают строго возрастающие слоты."""
+        pipeline = _make_pipeline(self._cfg(list(range(8, 22))))
+        try:
+            first = pipeline._next_slot(self._msk("2026-08-19T10:00:00+03:00"))
+            second = pipeline._next_slot(first)
+            self.assertGreater(second, first)
+        finally:
+            await pipeline.close()
 
 
 class StorageTests(unittest.TestCase):
