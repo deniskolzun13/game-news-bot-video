@@ -320,6 +320,84 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await pipeline.close()
 
+    async def test_awaiting_review_post_is_not_published(self):
+        """Пост на ревью не публикуется ни планово, ни с force — только после
+        кнопки «Опубликовать» (review_approve → reviewed)."""
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Config(
+                "token", "@channel", db_path=str(Path(directory) / "bot.db"),
+                dry_run=True,
+            )
+            pipeline = NewsPipeline(cfg)
+            publisher = _Publisher()
+            pipeline._publisher = publisher
+            try:
+                now = datetime.now(timezone.utc)
+                pipeline._storage.enqueue(
+                    "https://example.test/a", "source", "title", "text", None,
+                    now - timedelta(minutes=1), status="awaiting_review",
+                )
+                self.assertEqual(await pipeline.publish_due(), 0)
+                self.assertEqual(await pipeline.publish_due(force=True), 0)
+                self.assertEqual(publisher.posts, [])
+                self.assertEqual(pipeline._storage.queue_count(), 1)
+            finally:
+                await pipeline.close()
+
+    async def test_awaiting_review_publishes_after_approve(self):
+        """После одобрения (статус reviewed) пост выходит в свой слот."""
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Config(
+                "token", "@channel", db_path=str(Path(directory) / "bot.db"),
+                dry_run=True,
+            )
+            pipeline = NewsPipeline(cfg)
+            publisher = _Publisher()
+            pipeline._publisher = publisher
+            try:
+                now = datetime.now(timezone.utc)
+                pipeline._storage.enqueue(
+                    "https://example.test/a", "source", "title", "text", None,
+                    now - timedelta(minutes=1), status="awaiting_review",
+                )
+                row = pipeline._storage.due_items(now)[0]
+                self.assertTrue(await pipeline.review_approve(row["id"]))
+                self.assertEqual(await pipeline.publish_due(force=True), 1)
+                self.assertEqual(publisher.posts, ["text"])
+                self.assertEqual(pipeline._storage.queue_count(), 0)
+            finally:
+                await pipeline.close()
+
+    async def test_review_window_skips_awaiting_review(self):
+        """Повторный run_review не шлёт посты, которые уже на ревью."""
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Config(
+                "token", "@channel", db_path=str(Path(directory) / "bot.db"),
+                dry_run=True, review_window_hours=7,
+            )
+            pipeline = NewsPipeline(cfg)
+            try:
+                now = datetime.now(timezone.utc)
+                pipeline._storage.enqueue(
+                    "https://example.test/a", "s", "Свежий пост", "text", None,
+                    now, status="queued",
+                )
+                pipeline._storage.enqueue(
+                    "https://example.test/b", "s", "Уже на ревью", "text", None,
+                    now, status="awaiting_review",
+                )
+                pipeline._storage.enqueue(
+                    "https://example.test/c", "s", "Одобренный", "text", None,
+                    now, status="reviewed",
+                )
+                posts = pipeline._get_review_window_posts(now)
+                urls = [p["url"] for p in posts]
+                self.assertIn("https://example.test/a", urls)
+                self.assertNotIn("https://example.test/b", urls)
+                self.assertNotIn("https://example.test/c", urls)
+            finally:
+                await pipeline.close()
+
     async def test_next_slot_respects_minimum_delay(self):
         with tempfile.TemporaryDirectory() as directory:
             cfg = Config(

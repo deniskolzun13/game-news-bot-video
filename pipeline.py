@@ -417,6 +417,11 @@ class NewsPipeline:
         for row in due:
             if row["status"] == "awaiting" and (self._cfg.approve_posts or force):
                 continue
+            # Посты на ревью не публикуются без одобрения владельца:
+            # только review_approve (кнопка «Опубликовать») переводит их в
+            # reviewed, после чего пост выходит в свой слот.
+            if row["status"] == "awaiting_review":
+                continue
             fresh = self._is_fresh(row)
             if not fresh:
                 log.info("Новость устарела (старше %d ч) — пропускаем пост #%d: %s",
@@ -692,7 +697,7 @@ class NewsPipeline:
         window_end = now + timedelta(hours=self._cfg.review_window_hours)
         rows = self._storage.due_items(window_end)
         # Фильтруем только те, что еще не на ревью и не опубликованы
-        return [r for r in rows if r.get("status") not in ("awaiting", "reviewed")]
+        return [r for r in rows if r.get("status") not in ("awaiting", "awaiting_review", "reviewed")]
 
     async def run_review(self) -> int:
         """Запускает ежедневное ревью: шлёт владельцу посты на ближайшие 7 часов."""
