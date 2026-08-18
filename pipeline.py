@@ -27,7 +27,7 @@ from notifier import Notifier
 from parsers import build_parsers
 from parsers.base import NewsItem
 from publisher import TelegramPublisher
-from storage import Storage
+from storage import Storage, normalize_title
 
 log = logging.getLogger("pipeline")
 
@@ -554,22 +554,19 @@ class NewsPipeline:
         LLM решает, что это одна и та же новость (иначе два разных сюжета
         об одной игре не пересекались бы друг с другом).
         """
-        normalized = lambda t: re.sub(r"[^a-zа-яё0-9]+", "", t.lower())
-        norm_title = normalized(item.title)
+        norm_title = normalize_title(item.title)
         if len(norm_title) >= 10:
-            for other in self._storage.all_titles():
-                if normalized(other) == norm_title:
-                    log.info("Дубликат (тот же заголовок, что «%s»): %s — пропускаем",
-                             other, item.title)
-                    return True
+            other = self._storage.exact_norm_title(norm_title)
+            if other is not None:
+                log.info("Дубликат (тот же заголовок, что «%s»): %s — пропускаем",
+                         other, item.title)
+                return True
         if not game:
             return False
-        sig = re.sub(r"[^a-zа-яё0-9]+", "", game.lower())
+        sig = normalize_title(game)
         if not sig:
             return False
-        hits = [
-            t for t in self._storage.all_titles() if sig in normalized(t)
-        ]
+        hits = self._storage.titles_containing_game(sig)
         if not hits:
             return False
         for other in hits[:2]:

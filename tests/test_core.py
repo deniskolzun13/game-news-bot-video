@@ -6,7 +6,7 @@ from pathlib import Path
 
 from config import Config
 from pipeline import NewsPipeline
-from storage import Storage
+from storage import Storage, normalize_title
 
 
 class _NewsItem:
@@ -43,6 +43,55 @@ class StorageTests(unittest.TestCase):
                 self.assertTrue(storage.enqueue("https://example.test/a", "s", "t", "x", None, now))
                 self.assertFalse(storage.enqueue("https://example.test/a", "s", "t", "x", None, now))
                 self.assertEqual(storage.queue_count(), 1)
+            finally:
+                storage.close()
+
+    def test_exact_norm_title_finds_duplicate(self):
+        """Дубликат по заголовку ищется через norm_title, без перебора all_titles()."""
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "bot.db"))
+            try:
+                now = datetime.now(timezone.utc)
+                storage.enqueue("https://example.test/a", "s", "Cyberpunk 2077: Финал", "x", None, now)
+                found = storage.exact_norm_title(normalize_title("cyberpunk 2077 финал!!"))
+                self.assertEqual(found, "Cyberpunk 2077: Финал")
+                self.assertIsNone(storage.exact_norm_title(normalize_title("Cyberpunk 2078")))
+            finally:
+                storage.close()
+
+    def test_titles_containing_game_sig(self):
+        """Поиск заголовков с именем игры (гейт перед LLM-проверкой дубликата)."""
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "bot.db"))
+            try:
+                now = datetime.now(timezone.utc)
+                storage.enqueue("https://example.test/a", "s", "В Starfield добавили моды", "x", None, now)
+                storage.enqueue("https://example.test/b", "s", "Совсем про другую игру", "x", None, now)
+                hits = storage.titles_containing_game(normalize_title("Starfield"))
+                self.assertEqual(hits, ["В Starfield добавили моды"])
+            finally:
+                storage.close()
+
+    def test_backfilled_norm_title(self):
+        """Старые строки БД (без norm_title) получают его при открытии."""
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "bot.db")
+            storage = Storage(db_path)
+            now = datetime.now(timezone.utc)
+            storage.mark_published("https://example.test/a", "s", "Старая новость: Продолжение")
+            storage.close()
+
+            import sqlite3
+
+            conn = sqlite3.connect(db_path)
+            conn.execute("UPDATE published SET norm_title = NULL")
+            conn.commit()
+            conn.close()
+
+            storage = Storage(db_path)
+            try:
+                found = storage.exact_norm_title(normalize_title("старая новость продолжение"))
+                self.assertEqual(found, "Старая новость: Продолжение")
             finally:
                 storage.close()
 

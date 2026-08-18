@@ -3,11 +3,17 @@ import glob
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger("storage")
+
+
+def normalize_title(title: str) -> str:
+    """Нормализованный заголовок для поиска дубликатов (только буквы/цифры)."""
+    return re.sub(r"[^a-zа-яё0-9]+", "", title.lower())
 
 
 class Storage:
@@ -61,6 +67,34 @@ class Storage:
             self._conn.execute("ALTER TABLE post_queue ADD COLUMN created_at TEXT")
         except sqlite3.OperationalError:
             pass
+        # Нормализованный заголовок для быстрого поиска дубликатов (индекс вместо
+        # линейного перебора all_titles() в Python). Обратная миграция: заполняем
+        # norm_title для строк, созданных до появления колонки.
+        for table in ("published", "post_queue"):
+            try:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN norm_title TEXT")
+            except sqlite3.OperationalError:
+                pass
+        for url, title in self._conn.execute(
+            "SELECT url, title FROM published WHERE norm_title IS NULL"
+        ).fetchall():
+            self._conn.execute(
+                "UPDATE published SET norm_title = ? WHERE url = ?",
+                (normalize_title(title), url),
+            )
+        for qid, title in self._conn.execute(
+            "SELECT id, title FROM post_queue WHERE norm_title IS NULL"
+        ).fetchall():
+            self._conn.execute(
+                "UPDATE post_queue SET norm_title = ? WHERE id = ?",
+                (normalize_title(title), qid),
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS published_norm_title_idx ON published(norm_title)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS post_queue_norm_title_idx ON post_queue(norm_title)"
+        )
         # URL должен быть уникален и в очереди: несколько одновременно
         # обрабатываемых RSS-элементов иначе могут пройти предварительную проверку.
         self._conn.execute(
@@ -124,9 +158,9 @@ class Storage:
 
     def mark_published(self, url: str, source: str, title: str) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO published (url, source, title, published_at) "
-            "VALUES (?, ?, ?, ?)",
-            (url, source, title, datetime.now(timezone.utc).isoformat()),
+            "INSERT OR REPLACE INTO published (url, source, title, norm_title, published_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (url, source, title, normalize_title(title), datetime.now(timezone.utc).isoformat()),
         )
         self._conn.commit()
 
@@ -136,10 +170,12 @@ class Storage:
                 status: str = "queued", created_at: datetime | None = None) -> bool:
         """Ставит готовый пост в очередь публикации."""
         self._conn.execute(
-            "INSERT OR IGNORE INTO post_queue (url, source, title, text, photo, video, publish_at, status, extra_photos, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO post_queue "
+            "(url, source, title, text, photo, video, publish_at, status, extra_photos, created_at, norm_title) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (url, source, title, text, photo, video, publish_at.isoformat(), status, extra_photos,
-             (created_at or datetime.now(timezone.utc)).isoformat()),
+             (created_at or datetime.now(timezone.utc)).isoformat(),
+             normalize_title(title)),
         )
         inserted = self._conn.execute("SELECT changes()").fetchone()[0] == 1
         self._conn.commit()
@@ -268,6 +304,27 @@ class Storage:
         """Все заголовки из опубликованного и очереди — для поиска дубликатов."""
         rows = self._conn.execute(
             "SELECT title FROM published UNION SELECT title FROM post_queue"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def exact_norm_title(self, norm_title: str) -> str | None:
+        """Возвращает оригинальный заголовок, если такой же нормализованный
+        уже есть в опубликованном или в очереди (поиск по индексу norm_title)."""
+        row = self._conn.execute(
+            "SELECT title FROM published WHERE norm_title = ? "
+            "UNION SELECT title FROM post_queue WHERE norm_title = ? LIMIT 1",
+            (norm_title, norm_title),
+        ).fetchone()
+        return row[0] if row else None
+
+    def titles_containing_game(self, game_sig: str) -> list[str]:
+        """Заголовки, содержащие нормализованное имя игры (для LLM-проверки
+        дубликатов по одному событию)."""
+        like = f"%{game_sig}%"
+        rows = self._conn.execute(
+            "SELECT title FROM published WHERE norm_title LIKE ? "
+            "UNION SELECT title FROM post_queue WHERE norm_title LIKE ?",
+            (like, like),
         ).fetchall()
         return [r[0] for r in rows]
 
