@@ -8,3 +8,5 @@ data/
 assets/piper/*.onnx
 assets/piper/*.onnx.json
 assets/backgrounds/*.mp4
+output/
+work/
