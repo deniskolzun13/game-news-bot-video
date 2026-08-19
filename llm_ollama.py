@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import re
 
 import httpx
 
@@ -58,6 +60,45 @@ PROOFREAD_PROMPT = (
     "содержание, структуру, порядок абзацев и хэштеги. Не переписывай текст "
     "своими словами. Ответь только исправленным текстом поста целиком."
 )
+
+
+VIDEO_SCRIPT_PROMPT = """Ты — сценарист коротких новостных видео (вертикальный формат 9:16).
+Пишешь на русском языке. Стиль: энергичный, понятный, без воды.
+
+Правила:
+- Начинай сразу с новости, без приветствий («Всем привет...» запрещено).
+- Только факты из новости, ничего не выдумывай.
+- Без чрезмерного кликбейта.
+- Длина текста: 40–80 слов (примерно 20–45 секунд озвучки).
+- Структура: крючок (hook) → что произошло → главная информация →
+  почему это важно → короткое завершение.
+- Предложения короткие, для устного произношения.
+
+Всегда отвечай ТОЛЬКО JSON без пояснений в формате:
+{"headline": "КОРОТКИЙ ЗАГОЛОВОК ДО 8 СЛОВ", "script": "Полный текст сценария"}"""
+
+
+def parse_json_response(text: str) -> dict:
+    """Надёжно извлекает JSON из ответа модели."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.S)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    raise OllamaError(f"Не удалось разобрать JSON от модели: {text[:300]}")
 
 
 class OllamaError(Exception):
@@ -123,96 +164,105 @@ class OllamaClient:
             "Скачайте модель командой: `ollama pull %s`" % (self.model, self.fallback_model, self.model)
         )
 
-    async def rewrite(self, model: str, title: str, article_text: str) -> str:
-        """Переписывает новость в пост для Telegram через локальную LLM."""
-        user_prompt = f"Заголовок: {title}\n\nТекст статьи:\n{article_text[:5000]}"
+    async def _generate(self, model: str, prompt: str, system: str,
+                        temperature: float, num_ctx: int,
+                        json_mode: bool = False) -> str:
+        """Базовый запрос к /api/generate с общим семафором и обработкой ошибок."""
         payload = {
             "model": model,
-            "prompt": user_prompt,
-            "system": SYSTEM_PROMPT,
+            "prompt": prompt,
+            "system": system,
             "stream": False,
-            "temperature": 0.7,
-            "options": {"num_ctx": 8192},
+            "temperature": temperature,
+            "options": {"num_ctx": num_ctx},
         }
+        if json_mode:
+            payload["format"] = "json"
         async with self._sem:
             try:
                 resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
                 raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
+            return (resp.json().get("response") or "").strip()
 
-            text = (resp.json().get("response") or "").strip()
-            text = text.strip('"').strip("«»").strip()
-            if not text:
-                raise OllamaError("Ollama вернул пустой ответ")
-            return text
+    async def rewrite(self, model: str, title: str, article_text: str) -> str:
+        """Переписывает новость в пост для Telegram через локальную LLM."""
+        user_prompt = f"Заголовок: {title}\n\nТекст статьи:\n{article_text[:5000]}"
+        text = await self._generate(
+            model, user_prompt, SYSTEM_PROMPT, 0.7, 8192
+        )
+        text = text.strip('"').strip("«»").strip()
+        if not text:
+            raise OllamaError("Ollama вернул пустой ответ")
+        return text
 
     async def extract_game(self, model: str, title: str) -> str | None:
         """Выделяет название игры из заголовка через LLM.
 
         Возвращает None, если игры в заголовке нет или модель не ответила.
         """
-        payload = {
-            "model": model,
-            "prompt": f"Заголовок: {title}",
-            "system": GAME_NAME_PROMPT,
-            "stream": False,
-            "temperature": 0.0,
-            "options": {"num_ctx": 2048},
-        }
-        async with self._sem:
-            try:
-                resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
-                resp.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
-
-            name = (resp.json().get("response") or "").strip()
-            name = name.strip('"').strip("«»").strip()
-            if not name or name.lower() in ("нет", "no", "none", "-", "нет игры"):
-                return None
-            return name
+        name = await self._generate(
+            model, f"Заголовок: {title}", GAME_NAME_PROMPT, 0.0, 2048
+        )
+        name = name.strip('"').strip("«»").strip()
+        if not name or name.lower() in ("нет", "no", "none", "-", "нет игры"):
+            return None
+        return name
 
     async def is_same_news(self, model: str, title_a: str, title_b: str) -> bool:
         """Одна и та же новость в двух заголовках? (LLM, ответ «да»/«нет»)."""
-        payload = {
-            "model": model,
-            "prompt": f"Новость 1: {title_a}\nНовость 2: {title_b}",
-            "system": DEDUP_PROMPT,
-            "stream": False,
-            "temperature": 0.0,
-            "options": {"num_ctx": 2048},
-        }
-        async with self._sem:
-            try:
-                resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
-                resp.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
-            return (resp.json().get("response") or "").strip().lower().startswith("да")
+        response = await self._generate(
+            model,
+            f"Новость 1: {title_a}\nНовость 2: {title_b}",
+            DEDUP_PROMPT,
+            0.0,
+            2048,
+        )
+        return response.lower().startswith("да")
 
     async def proofread(self, model: str, text: str) -> str:
         """Вычитка поста: исправляет орфографию/грамматику без правки содержания."""
-        payload = {
-            "model": model,
-            "prompt": text,
-            "system": PROOFREAD_PROMPT,
-            "stream": False,
-            "temperature": 0.0,
-            "options": {"num_ctx": 4096},
-        }
-        async with self._sem:
-            try:
-                resp = await self._client.post(f"{self.base_url}/api/generate", json=payload)
-                resp.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
+        fixed = await self._generate(
+            model, text, PROOFREAD_PROMPT, 0.0, 4096
+        )
+        fixed = fixed.strip('"').strip("«»").strip()
+        if not fixed:
+            raise OllamaError("Ollama вернул пустой ответ на вычитку")
+        return fixed
 
-            fixed = (resp.json().get("response") or "").strip()
-            fixed = fixed.strip('"').strip("«»").strip()
-            if not fixed:
-                raise OllamaError("Ollama вернул пустой ответ на вычитку")
-            return fixed
+    async def generate_json(self, model: str, prompt: str, system: str,
+                            temperature: float = 0.7, num_ctx: int = 4096) -> dict:
+        """Запрос в JSON-режиме (Ollama format=json) с надёжным разбором."""
+        raw = await self._generate(
+            model, prompt, system, temperature, num_ctx, json_mode=True
+        )
+        return parse_json_response(raw)
+
+    async def video_script(self, model: str, title: str, description: str,
+                           source: str, category: str = "") -> dict:
+        """Генерирует сценарий видео и короткий заголовок.
+
+        Возвращает {'headline': str, 'script': str}.
+        """
+        prompt = (
+            "Напиши короткий сценарий видео по новости.\n\n"
+            f"Заголовок: {title}\n"
+            f"Описание: {(description or '')[:1200]}\n"
+            f"Источник: {source}\n"
+            f"Категория: {category}\n\n"
+            "Верни JSON: headline — короткий броский заголовок для экрана "
+            "(до 8 слов, без точки), script — полный текст сценария на "
+            "русском для озвучки."
+        )
+        data = await self.generate_json(model, prompt, VIDEO_SCRIPT_PROMPT, 0.7)
+        headline = str(data.get("headline") or "").strip().strip('"')
+        script = str(data.get("script") or "").strip().strip('"')
+        if not script:
+            raise OllamaError("Модель не вернула текст сценария")
+        if not headline:
+            headline = (title or script)[:60]
+        return {"headline": headline[:80], "script": script}
 
     async def close(self) -> None:
         await self._client.aclose()

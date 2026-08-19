@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -6,7 +7,7 @@ from pathlib import Path
 
 import pipeline as pipeline_module
 from config import Config
-from llm_ollama import OllamaClient
+from llm_ollama import OllamaClient, parse_json_response
 from pipeline import NewsPipeline
 from storage import Storage, normalize_title
 
@@ -447,3 +448,155 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(calls[0], calls[1])
             finally:
                 await pipeline.close()
+
+
+class NewsLifecycleTests(unittest.TestCase):
+    """Жизненный цикл новости: status (Telegram) + video_status (видео)."""
+
+    def test_upsert_news_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "bot.db"))
+            try:
+                nid = storage.upsert_news(
+                    "https://example.test/a", "s", "Новость", "Описание",
+                    "2026-08-20T10:00:00+00:00",
+                )
+                self.assertGreater(nid, 0)
+                again = storage.upsert_news(
+                    "https://example.test/a", "s", "Новость", "Описание",
+                    "2026-08-20T10:00:00+00:00",
+                )
+                self.assertEqual(nid, again, "повторная вставка — тот же id")
+            finally:
+                storage.close()
+
+    def test_news_photos_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "bot.db"))
+            try:
+                nid = storage.upsert_news(
+                    "https://example.test/a", "s", "Новость", "Описание", ""
+                )
+                storage.save_news_photos(nid, [b"jpeg-one", b"jpeg-two"])
+                news = storage.get_news(nid)
+                self.assertEqual(storage.load_news_photos(news), [b"jpeg-one", b"jpeg-two"])
+            finally:
+                storage.close()
+
+    def test_video_lifecycle(self):
+        """Полный цикл видео: none → processing → ready → published → pending(retry)."""
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "bot.db"))
+            try:
+                nid = storage.upsert_news(
+                    "https://example.test/a", "s", "Новость", "Описание", ""
+                )
+                storage.set_news_status(nid, "telegram_published")
+                storage.set_video_status(nid, "video_processing")
+                storage.mark_video_ready(nid, "/tmp/a.mp4", 30.5, "script", "headline")
+                storage.mark_video_published(nid, "https://drive.google.com/file/d/x/view")
+                news = storage.get_news(nid)
+                self.assertEqual(news["status"], "telegram_published")
+                self.assertEqual(news["video_status"], "video_published")
+                self.assertEqual(news["video_duration"], 30.5)
+                self.assertEqual(news["video_path"], "/tmp/a.mp4")
+                # новость с видео больше не в очереди
+                self.assertNotIn(nid, [r["id"] for r in storage.video_pending()])
+                # retry возвращает в очередь
+                self.assertTrue(storage.retry_video(nid))
+                self.assertEqual(storage.get_news(nid)["video_status"], "pending")
+                self.assertIn(nid, [r["id"] for r in storage.video_pending()])
+            finally:
+                storage.close()
+
+    def test_video_pending_only_published_news(self):
+        """Видео-очередь берёт только опубликованные новости (независимость от Telegram)."""
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "bot.db"))
+            try:
+                nid_ready = storage.upsert_news(
+                    "https://example.test/p", "s", "Опубликована", "Описание", ""
+                )
+                storage.set_news_status(nid_ready, "telegram_published")
+                nid_new = storage.upsert_news(
+                    "https://example.test/n", "s", "Новая", "Описание", ""
+                )
+                pending = [r["id"] for r in storage.video_pending()]
+                self.assertIn(nid_ready, pending)
+                self.assertNotIn(nid_new, pending)
+            finally:
+                storage.close()
+
+    def test_news_stats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "bot.db"))
+            try:
+                a = storage.upsert_news("https://example.test/a", "s", "A", "", "")
+                storage.set_news_status(a, "telegram_ready")
+                b = storage.upsert_news("https://example.test/b", "s", "B", "", "")
+                storage.set_news_status(b, "telegram_published")
+                storage.set_video_status(b, "video_ready")
+                stats = storage.news_stats()
+                self.assertEqual(stats["status"].get("telegram_ready"), 1)
+                self.assertEqual(stats["status"].get("telegram_published"), 1)
+                self.assertEqual(stats["video_status"].get("video_ready"), 1)
+            finally:
+                storage.close()
+
+
+class OllamaJsonTests(unittest.IsolatedAsyncioTestCase):
+    def test_parse_json_response_strips_code_fences(self):
+        data = parse_json_response('```json\n{"headline": "H", "script": "S"}\n```')
+        self.assertEqual(data, {"headline": "H", "script": "S"})
+
+    def test_parse_json_response_extracts_embedded_json(self):
+        data = parse_json_response('Вот результат: {"score": 7, "interesting": true}')
+        self.assertEqual(data["score"], 7)
+        self.assertTrue(data["interesting"])
+
+    def test_parse_json_response_raises_on_garbage(self):
+        with self.assertRaises(Exception):
+            parse_json_response("никакого json нет")
+
+    async def test_video_script_uses_json_mode(self):
+        """video_script должен запросить JSON у модели и вернуть headline+script."""
+        import httpx
+
+        class _FakeTransport(httpx.AsyncBaseTransport):
+            def __init__(self):
+                self.used_format = None
+
+            async def handle_async_request(self, request):
+                body = json.loads(request.content)
+                self.used_format = body.get("format")
+                return httpx.Response(
+                    200, json={"response": '{"headline": "Заголовок", "script": "Сценарий текста"}'
+                })
+
+        transport = _FakeTransport()
+        client = OllamaClient("http://ollama.test", "model", "fallback", timeout=5)
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(transport=transport, timeout=5)
+        try:
+            res = await client.video_script("model", "Заголовок", "Описание", "stopgame")
+            self.assertEqual(res["headline"], "Заголовок")
+            self.assertEqual(res["script"], "Сценарий текста")
+            self.assertEqual(transport.used_format, "json")
+        finally:
+            await client.close()
+
+    async def test_video_script_raises_without_script(self):
+        import httpx
+
+        class _FakeTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(200, json={"response": '{"headline": "H"}'})
+
+        client = OllamaClient("http://ollama.test", "model", "fallback", timeout=5)
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(transport=_FakeTransport(), timeout=5)
+        try:
+            with self.assertRaises(Exception):
+                await client.video_script("model", "Заголовок", "Описание", "s")
+        finally:
+            await client.close()

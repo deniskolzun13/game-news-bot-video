@@ -4,3 +4,7 @@ __pycache__/
 .env
 logs/
 data/
+# Модели Piper и фоновые видео (скачиваются локально)
+assets/piper/*.onnx
+assets/piper/*.onnx.json
+assets/backgrounds/*.mp4

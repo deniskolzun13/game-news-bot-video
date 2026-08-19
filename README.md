@@ -1,13 +1,19 @@
-# Бот новостей об играх для Telegram
+# Бот новостей об играх для Telegram + AI-видео
 
 Парсит новости с русскоязычных игровых сайтов (StopGame, Igromania, DTF), переписывает их
-локальной LLM (Ollama) и публикует в Telegram-канал.
+локальной LLM (Ollama) и публикует в Telegram-канал. Для каждой опубликованной
+новости дополнительно генерируется короткое вертикальное видео (9:16) с озвучкой
+и субтитрами — независимо от Telegram-публикации.
 
 ## Как это работает
 
 ```
 RSS-ленты → парсеры → страница статьи (текст + фото) → Ollama → подбор фото
 → очередь свежих постов → Telegram-канал → SQLite (дедуп)
+                              ↓ (после публикации поста)
+              видео-очередь: Ollama(сценарий) → Piper(озвучка) → Whisper(субтитры)
+              → FFmpeg(MP4 из фото новости) → QC(ffprobe) → output/videos/
+              → (опционально) Google Drive
 ```
 
 - **Источники** (проверено на август 2026):
@@ -80,22 +86,52 @@ RSS-ленты → парсеры → страница статьи (текст 
 - **Лимит caption**: если текст длиннее 1024 символов, фото и текст уходят
   отдельными сообщениями.
 - **Ошибки источников изолированы**: падение одного сайта не останавливает бот.
+- **AI-видео** (`VIDEO_ENABLED=true`): для каждой опубликованной новости бот
+  генерирует вертикальное видео 1080×1920 (9:16) длительностью 20–45 секунд.
+  Сценарий и короткий заголовок пишет локальная LLM (JSON-режим), озвучка —
+  Piper (`assets/piper/ru_RU-irina-medium.onnx`), субтитры — whisper-timestamped,
+  сборка — FFmpeg (H.264 + AAC; кодировщик определяется автоматически:
+  libx264 → libopenh264 → аппаратные). Видео собирается из фото новости
+  (несколько фото + переход crossfade/fade + размытый фон) либо из фонового
+  видео `assets/backgrounds/*.mp4`, если фото нет.
+- **Независимая видео-очередь**: сбой видео НЕ влияет на публикацию поста.
+  Видео обрабатывается после выхода поста в канал; повтор после ошибки —
+  команда `/retry <id>`. Статусы: `none → video_processing → video_ready →
+  video_published` (или `failed`).
+- **Google Drive** (опционально): при `UPLOAD_TO_DRIVE=true` готовое видео
+  загружается в папку `GAMENEWS_VIDEOS/<дата>` и публикуется по ссылке.
+  Нужны `credentials.json` и установка google-библиотек (см. requirements.txt).
+- **Статусы новостей** (`news` в БД): `new / processing / telegram_ready /
+  telegram_published / completed / rejected / failed` для поста и отдельно
+  `video_status` для видео. Сводка — команда `/status`.
 
 ## Структура проекта
 
 ```
-├── bot.py            # точка входа: цикл по расписанию (+ --once, --now, --dry-run)
+├── bot.py            # точка входа: цикл по расписанию (+ --once, --now, --dry-run,
+│                     #   --test, --generate-video <id>) + видео-воркер
 ├── commands.py       # панель кнопок-плиток и команды в личке владельцу
-├── config.py         # чтение .env и настроек
+├── config.py         # чтение .env и настроек (единый конфиг: Telegram + видео)
 ├── logging_setup.py  # лог в файл logs/bot.log + консоль
-├── storage.py        # SQLite: опубликованные URL + очередь постов (+ статусы утверждения)
+├── storage.py        # SQLite: опубликованные URL + очередь постов + статусы news/video
 ├── pipeline.py       # обработка новости: парс → LLM → фото → публикация/утверждение
+├── video_pipeline.py # независимая видео-очередь: сценарий → TTS → субтитры → MP4 → QC
 ├── article.py        # текст и фото со страницы статьи (селекторы по сайтам)
 ├── images.py         # цепочка подбора фото + ужатие под Telegram
-├── llm_ollama.py     # Ollama: проверка serve/модели, пересказ, вычитка, название игры
+├── llm_ollama.py     # Ollama: пересказ, вычитка, JSON-режим, сценарий видео
 ├── publisher.py      # публикация в Telegram (aiogram): фото/галерея/видео
 ├── notifier.py       # уведомления об ошибках + отправка постов на утверждение
 ├── owner.py          # chat_id владельца (OWNER_CHAT_ID или файл)
+├── video/
+│   ├── generator.py  # FFmpeg-сборка MP4 + детект кодировщика + QC через ffprobe
+│   └── templates.py  # фильтры: фото+переходы/размытый фон/фоновое видео/субтитры
+├── tts/
+│   ├── piper.py      # Piper TTS через CLI
+│   └── generator.py  # движок озвучки: piper → espeak-ng (фолбэк)
+├── subtitles/
+│   └── whisper.py    # whisper-timestamped: фразы с таймкодами → ASS/SRT
+├── google_drive/
+│   └── uploader.py   # загрузка видео на Google Drive (OAuth, ленивые импорты)
 ├── parsers/
 │   ├── rss_base.py   # общий RSS-парсер (feedparser)
 │   ├── stopgame.py   # StopGame
@@ -104,6 +140,9 @@ RSS-ленты → парсеры → страница статьи (текст 
 │   ├── threednews.py # 3DNews (игровой раздел)
 │   ├── vgtimes.py    # VGTimes (фильтр gaming-news/articles)
 │   └── __init__.py   # реестр источников
+├── assets/
+│   ├── backgrounds/  # фоновые mp4 для видео (необязательно)
+│   └── piper/        # модели Piper (ru_RU-irina-medium.onnx + .onnx.json)
 ├── .env.example
 └── requirements.txt
 ```
@@ -117,6 +156,20 @@ cp .env.example .env     # затем заполнить .env (см. чек-ли
 .venv/bin/python bot.py --dry-run   # проверить сбор без публикации
 .venv/bin/python bot.py             # запустить
 ```
+
+### Видео (локально)
+
+- **FFmpeg** с H.264: `sudo apt install ffmpeg libopenh264-7` (если нет
+  libx264, бот сам возьмёт libopenh264).
+- **Piper TTS**: `pip install piper-tts` (уже в requirements). Русский голос
+  `ru_RU-irina-medium.onnx` и `ru_RU-irina-medium.onnx.json` — в `assets/piper/`
+  (скачать с https://huggingface.co/rhasspy/piper-voices). Если Piper недоступен,
+  `TTS_ENGINE=auto` откатится на `espeak-ng` (`sudo apt install espeak-ng`).
+- **Субтитры**: `whisper-timestamped` (в requirements) скачает модель Whisper
+  при первом рендере (`WHISPER_MODEL=small`, `WHISPER_DEVICE=cpu`).
+- **Google Drive** (опционально): `pip install google-api-python-client
+  google-auth-oauthlib`, положить `credentials.json` в корень, включить
+  `UPLOAD_TO_DRIVE=true`. При первом запуске откроется браузер для OAuth.
 
 ## Запуск как systemd-сервис (используется здесь)
 
@@ -155,6 +208,18 @@ loginctl enable-linger $USER   # запуск при загрузке без в�
 запуск по системным часам; нужно следить, чтобы прошлый прогон не
 пересекался с новым (обычно не проблема при таком интервале).
 
+## Команды и CLI
+
+**В личке владельцу** (кнопки и команды): `/publish_now`, `/stats`, `/next`,
+`/health`, `/videos` (список сгенерированных видео), `/generate <id>` (видео
+для новости #id), `/retry <id>` (повторить видео после ошибки), `/status`
+(статусы новостей: пост + видео), `/settings` (текущие настройки), `/help`.
+
+**CLI** (`python bot.py`): `--once` (один сбор и выход), `--now` / `--publish-now`
+(свежая новость сразу в канал), `--dry-run` (без публикации), `--test` (то же,
+но без сети Telegram), `--generate-video <id>` (сгенерировать видео для новости
+и выйти).
+
 ## Чек-лист запуска
 
 1. **Установить Python 3.10+** — `python3 --version`.
@@ -168,6 +233,10 @@ loginctl enable-linger $USER   # запуск при загрузке без в�
 8. **Заполнить `.env`** (скопировать из `.env.example`):
    `TELEGRAM_BOT_TOKEN=...`, `TELEGRAM_CHANNEL_ID=@имя_канала`.
 9. **Установить зависимости**: `pip install -r requirements.txt`.
-10. **Проверить без публикации**: `python bot.py --dry-run` — в консоль и
+10. **Установить FFmpeg + H.264** и (для видео) русскую модель Piper в
+    `assets/piper/` (см. выше).
+11. **Проверить без публикации**: `python bot.py --dry-run` — в консоль и
     `logs/bot.log` уйдёт, что бот нашёл и что бы опубликовал.
-11. **Запустить**: `python bot.py` (или через cron/`--once`, или systemd).
+12. **Проверить видео на тестовой новости**: `python bot.py --generate-video <id>`
+    (сначала выполните `--dry-run`, чтобы появились записи в таблице news).
+13. **Запустить**: `python bot.py` (или через cron/`--once`, или systemd).

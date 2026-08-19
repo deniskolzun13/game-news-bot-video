@@ -23,6 +23,8 @@ from aiogram.types import (
 
 from owner import load_owner, save_owner
 from pipeline import NewsPipeline
+from storage import Storage
+from video_pipeline import VideoPipeline
 
 log = logging.getLogger("commands")
 
@@ -42,7 +44,10 @@ PANEL = InlineKeyboardMarkup(inline_keyboard=[
         InlineKeyboardButton(text="Статистика", callback_data="stats"),
     ],
     [
+        InlineKeyboardButton(text="Видео", callback_data="videos"),
         InlineKeyboardButton(text="Здоровье", callback_data="health"),
+    ],
+    [
         InlineKeyboardButton(text="Помощь", callback_data="help"),
     ],
 ])
@@ -53,6 +58,11 @@ HELP_TEXT = (
     "/publish_now — обработать и опубликовать одну свежую новость\n"
     "/stats — статистика: опубликовано постов, очередь\n"
     "/next — когда следующий пост из очереди\n"
+    "/videos — список сгенерированных видео\n"
+    "/generate <id> — сгенерировать видео для новости #id\n"
+    "/retry <id> — повторить видео для новости #id (если была ошибка)\n"
+    "/status — статусы новостей (Telegram + видео)\n"
+    "/settings — текущие настройки (видео, TTS, Whisper, очередь)\n"
     "/health — здоровье бота: Ollama, БД, ошибки за сутки\n"
     "/help — список команд\n\n"
     "Посты перед публикацией приходят вам на утверждение с кнопками "
@@ -68,9 +78,11 @@ def _fmt(iso: str) -> str:
 
 
 class CommandLoop:
-    def __init__(self, cfg, pipeline: NewsPipeline):
+    def __init__(self, cfg, pipeline: NewsPipeline, video_pipeline: VideoPipeline | None = None):
         self._cfg = cfg
         self._pipeline = pipeline
+        self._video_pipeline = video_pipeline
+        self._storage = Storage(cfg.db_path)
         self._bot = Bot(token=cfg.telegram_token)
         self._owner_id = load_owner(cfg.db_path)
         self._awaiting_post = False
@@ -149,6 +161,16 @@ class CommandLoop:
             await self._send(msg.chat.id, await self._cmd_next())
         elif cmd == "/health":
             await self._send(msg.chat.id, await self._cmd_health())
+        elif cmd == "/videos":
+            await self._send(msg.chat.id, await self._cmd_videos())
+        elif cmd == "/generate":
+            await self._send(msg.chat.id, await self._cmd_generate(parts))
+        elif cmd == "/retry":
+            await self._send(msg.chat.id, await self._cmd_retry(parts))
+        elif cmd == "/status":
+            await self._send(msg.chat.id, await self._cmd_status())
+        elif cmd == "/settings":
+            await self._send(msg.chat.id, await self._cmd_settings())
         elif cmd in ("/help", "/start"):
             await self._send(msg.chat.id, HELP_TEXT)
             await self._send(msg.chat.id, "Управление ботом:", keyboard=PANEL)
@@ -204,6 +226,9 @@ class CommandLoop:
             elif data == "health":
                 await self._bot.answer_callback_query(cb.id)
                 await self._send(cb.message.chat.id, await self._cmd_health())
+            elif data == "videos":
+                await self._bot.answer_callback_query(cb.id)
+                await self._send(cb.message.chat.id, await self._cmd_videos())
             elif data == "help":
                 await self._bot.answer_callback_query(cb.id)
                 await self._send(cb.message.chat.id, HELP_TEXT)
@@ -260,6 +285,86 @@ class CommandLoop:
         if not s["queued"]:
             return "Очередь пуста — следующий пост появится после ближайшего сбора новостей."
         return f"В очереди {s['queued']} пост(ов). Следующий — {_fmt(s['next_publish_at'])} МСК."
+
+    async def _cmd_videos(self) -> str:
+        rows = self._storage.list_videos(limit=20)
+        if not rows:
+            return "Сгенерированных видео пока нет. Видео создаётся автоматически после публикации новости."
+        lines = [f"Видео ({len(rows)}):"]
+        for r in rows:
+            status = r["video_status"]
+            created = _fmt(r["video_created_at"]) if r["video_created_at"] else "—"
+            title = (r["title"] or "")[:60]
+            line = f"#{r['id']} [{status}] {created} МСК — {title}"
+            if r["video_error"]:
+                line += f"\n    ошибка: {r['video_error'][:100]}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    async def _cmd_generate(self, parts: list[str]) -> str:
+        if self._video_pipeline is None:
+            return "Видео отключено (VIDEO_ENABLED=false или dry-run)."
+        if len(parts) < 2 or not parts[1].isdigit():
+            return "Использование: /generate <id новости>"
+        news_id = int(parts[1])
+        res = await self._video_pipeline.generate_one(news_id)
+        if res.get("ready"):
+            msg = f"✅ Видео для новости #{news_id} готово:\n{res.get('mp4', '')}"
+            if res.get("drive_url"):
+                msg += f"\n🔗 {res['drive_url']}"
+            return msg
+        return f"❌ Ошибка генерации для #{news_id}:\n{res.get('error', 'неизвестно')}"
+
+    async def _cmd_retry(self, parts: list[str]) -> str:
+        if len(parts) < 2 or not parts[1].isdigit():
+            return "Использование: /retry <id новости>"
+        news_id = int(parts[1])
+        if not self._storage.retry_video(news_id):
+            return f"Новость #{news_id} не найдена."
+        return f"Новость #{news_id} возвращена в видео-очередь. Обработка — в ближайшем цикле."
+
+    async def _cmd_status(self) -> str:
+        stats = self._storage.news_stats()
+        s = self._pipeline.stats()
+        lines = ["Статусы новостей:"]
+        labels = {
+            "new": "новые", "processing": "обработка", "telegram_ready": "ждёт публикации",
+            "telegram_published": "опубликованы (TG)", "completed": "готовы полностью",
+            "rejected": "отклонены", "failed": "ошибки",
+        }
+        for status, label in labels.items():
+            count = stats["status"].get(status, 0)
+            if count:
+                lines.append(f"  {label}: {count}")
+        vlabels = {
+            "none": "без видео", "pending": "ждут видео", "video_processing": "видео в работе",
+            "video_ready": "видео готово", "video_published": "видео загружено", "failed": "ошибка видео",
+        }
+        lines.append("Видео:")
+        for status, label in vlabels.items():
+            count = stats["video_status"].get(status, 0)
+            if count:
+                lines.append(f"  {label}: {count}")
+        lines.append(f"В очереди публикации: {s['queued']}")
+        return "\n".join(lines)
+
+    async def _cmd_settings(self) -> str:
+        cfg = self._cfg
+        lines = [
+            "Настройки:",
+            f"Видео: {'включено' if cfg.video_enabled else 'выключено'} "
+            f"({cfg.video_width}x{cfg.video_height}, {cfg.video_fps} fps, "
+            f"{cfg.min_video_duration}–{cfg.max_video_duration} с, encoder={cfg.video_encoder})",
+            f"TTS: {cfg.tts_engine}, голос: {cfg.tts_voice}, скорость: {cfg.tts_speed}",
+            f"Whisper: модель {cfg.whisper_model}, device={cfg.whisper_device}",
+            f"Ollama: {cfg.ollama_base_url} (модель {cfg.ollama_model}, "
+            f"fallback {cfg.ollama_fallback_model}, concurrency={cfg.ollama_concurrency})",
+            f"Google Drive: {'включён' if cfg.upload_to_drive else 'выключен'}",
+            f"Очередь: до {cfg.queue_capacity} постов, свежесть {cfg.news_freshness_hours} ч",
+            f"Тихие часы: {cfg.quiet_start_hour}:00–{cfg.quiet_end_hour}:00",
+            f"Сбор: каждые {cfg.poll_interval_minutes} мин",
+        ]
+        return "\n".join(lines)
 
     async def _send_queue(self, chat_id: int) -> None:
         rows = self._pipeline.queue_items()
@@ -403,4 +508,5 @@ class CommandLoop:
         ]))
 
     async def close(self) -> None:
+        self._storage.close()
         await self._bot.session.close()

@@ -4,3 +4,9 @@ feedparser>=6.0
 httpx>=0.27
 Pillow>=11.3
 python-dotenv>=1.0
+piper-tts>=1.7
+whisper-timestamped>=1.15
+
+# --- Опционально: загрузка видео на Google Drive ---
+# google-api-python-client>=2.100
+# google-auth-oauthlib>=1.0

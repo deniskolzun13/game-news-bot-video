@@ -20,6 +20,7 @@ from config import load_config
 from logging_setup import setup_logging
 from notifier import Notifier
 from pipeline import NewsPipeline
+from video_pipeline import VideoPipeline
 
 log = logging.getLogger("bot")
 
@@ -33,6 +34,22 @@ async def run_once(pipeline: NewsPipeline) -> None:
         log.info("Источник %s: найдено=%d запланировано=%d ошибок=%d",
                  source, found, queued, errors)
     log.info("=== Сбор завершён ===")
+
+
+async def run_video_queue(video_pipeline: VideoPipeline, limit: int = 3) -> None:
+    """Обрабатывает независимую видео-очередь (не блокирует Telegram-публикацию)."""
+    if video_pipeline is None:
+        return
+    try:
+        results = await video_pipeline.process_pending(limit=limit)
+        for res in results:
+            if res.get("error"):
+                log.warning("[VIDEO] #%s «%s» — %s",
+                            res.get("news_id"), res.get("title"), res.get("error"))
+            else:
+                log.info("[VIDEO] #%s «%s» — готово", res.get("news_id"), res.get("title"))
+    except Exception:
+        log.exception("Ошибка видео-очереди")
 
 
 def _is_review_time(cfg, now: datetime) -> tuple[bool, int | None]:
@@ -52,26 +69,46 @@ async def main() -> None:
                         help="выполнить один сбор и завершиться (удобно для cron)")
     parser.add_argument("--now", action="store_true",
                         help="обработать и сразу опубликовать одну свежую новость")
+    parser.add_argument("--publish-now", action="store_true",
+                        help="синоним --now")
     parser.add_argument("--dry-run", action="store_true",
                         help="собрать и обработать новости без публикации в Telegram")
+    parser.add_argument("--generate-video", metavar="NEWS_ID", type=int, default=None,
+                        help="сгенерировать видео для конкретной новости по id")
+    parser.add_argument("--test", action="store_true",
+                        help="тестовый прогон сбора без публикации и без сети Telegram")
     args = parser.parse_args()
+    if args.publish_now:
+        args.now = True
 
-    cfg = load_config(dry_run=args.dry_run)
+    cfg = load_config(dry_run=args.dry_run or args.test)
     setup_logging(cfg.log_dir)
 
-    notifier = Notifier(cfg.telegram_token, cfg.db_path) if not args.dry_run else None
+    notifier = Notifier(cfg.telegram_token, cfg.db_path) if not (args.dry_run or args.test) else None
     pipeline = NewsPipeline(cfg, notifier)
+    video_pipeline = VideoPipeline(cfg, notifier) if not (args.dry_run or args.test) else None
     try:
+        if args.generate_video is not None:
+            res = await video_pipeline.generate_one(args.generate_video)
+            print(f"Новость #{args.generate_video}: {'ГОТОВО' if res['ready'] else 'ОШИБКА'}")
+            for step, status in res.get("steps", {}).items():
+                print(f"  {step}: {status}")
+            if res.get("mp4"):
+                print(f"  MP4: {res['mp4']}")
+            if res.get("error"):
+                print(f"  Ошибка: {res['error']}")
+            return
         if args.now:
             if await pipeline.publish_one_now():
                 await pipeline.publish_due(force=True)
             return
-        if args.once or args.dry_run:
+        if args.once or args.dry_run or args.test:
             await run_once(pipeline)
+            await run_video_queue(video_pipeline, limit=1)
             # Одноразовый запуск (например, из cron) не обрабатывает callback-и
             # Telegram, поэтому новые queued-посты публикуем сразу. Уже отправленные
             # на утверждение записи остаются ждать нажатия кнопки.
-            await pipeline.publish_due(force=not args.dry_run)
+            await pipeline.publish_due(force=not (args.dry_run or args.test))
             return
 
         log.info(
@@ -84,7 +121,7 @@ async def main() -> None:
         backup = pipeline.backup()
         if backup:
             log.info("Бэкап БД: %s", backup)
-        cmd_loop = CommandLoop(cfg, pipeline)
+        cmd_loop = CommandLoop(cfg, pipeline, video_pipeline)
         cmd_task = asyncio.create_task(cmd_loop.run())
         try:
             try:
@@ -111,6 +148,10 @@ async def main() -> None:
                     log.exception("Ошибка при публикации из очереди")
                     if notifier:
                         await notifier.notify("loop", "Ошибка при публикации из очереди.")
+
+                # Независимая видео-очередь: сбой не ломает публикацию постов.
+                if cfg.video_enabled and video_pipeline is not None:
+                    await run_video_queue(video_pipeline, limit=1)
 
                 # Проверка времени ревью
                 is_review_time, review_hour = _is_review_time(cfg, now)
@@ -139,6 +180,8 @@ async def main() -> None:
             await cmd_loop.close()
     finally:
         await pipeline.close()
+        if video_pipeline:
+            await video_pipeline.close()
         if notifier:
             await notifier.close()
 

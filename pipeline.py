@@ -285,6 +285,17 @@ class NewsPipeline:
         text = _format_post(text)
         return Post(text=text, photos=photos, video=video, game=game)
 
+    def _news_id_for(self, item: NewsItem, photos: list[bytes] | None = None) -> int:
+        """Создаёт/возвращает запись новости для отслеживания видео-статуса."""
+        news_id = self._storage.upsert_news(
+            item.url, item.source, item.title,
+            description=item.description or "",
+            published_at=(item.published_at or datetime.now(timezone.utc)).isoformat(),
+        )
+        if photos and news_id:
+            self._storage.save_news_photos(news_id, photos)
+        return news_id
+
     async def _process_item(self, item: NewsItem, model: str, publish_at: datetime) -> bool:
         if self._storage.is_published(item.url) or self._storage.is_queued(item.url):
             log.debug("Уже публиковалось или в очереди: %s", item.url)
@@ -294,6 +305,9 @@ class NewsPipeline:
         post = await self._build_post(item, model)
         if post is None:
             return False
+        news_id = self._news_id_for(item)
+        if news_id:
+            self._storage.set_news_status(news_id, "telegram_ready")
 
         if self._publisher is None:
             log.info("[dry-run] Был бы запланирован пост на %s UTC (%d символов, фото: %d, видео: %s)",
@@ -335,6 +349,9 @@ class NewsPipeline:
                     post = await self._build_post(item, model)
                     if post is None:
                         continue
+                    news_id = self._news_id_for(item, post.photos)
+                    if news_id:
+                        self._storage.set_news_status(news_id, "telegram_ready")
                     if self._publisher is None:
                         log.info("[dry-run] Немедленная публикация:\n%s", post.text)
                     else:
@@ -433,6 +450,7 @@ class NewsPipeline:
                 self._storage.record_messages(ids)
                 self._storage.mark_published(row["url"], row["source"], row["title"])
                 self._storage.dequeue(row["id"])
+                self._mark_telegram_published(row)
                 published += 1
             except Exception:
                 log.exception("Ошибка публикации из очереди (%s) — попробуем позже", row["url"])
@@ -458,6 +476,7 @@ class NewsPipeline:
             self._storage.record_messages(ids)
             self._storage.mark_published(row["url"], row["source"], row["title"])
             self._storage.dequeue(queue_id)
+            self._mark_telegram_published(row)
             return True
         except Exception:
             log.exception("Ошибка публикации одобренного поста #%d", queue_id)
@@ -466,6 +485,15 @@ class NewsPipeline:
                     "publish", "Не удалось опубликовать одобренный пост — проверьте журнал."
                 )
             return False
+
+    def _mark_telegram_published(self, row: dict) -> None:
+        """Помечает новость как опубликованную в Telegram (для видео-очереди)."""
+        try:
+            news = self._storage.get_news_by_url(row["url"])
+            if news is not None:
+                self._storage.set_news_status(news["id"], "telegram_published")
+        except Exception:
+            log.warning("Не удалось отметить новость опубликованной: %s", row.get("url"))
 
     def skip_approved(self, queue_id: int) -> bool:
         """Отклоняет пост (кнопка «Пропустить»): убирает из очереди и помечает
