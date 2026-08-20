@@ -1,5 +1,10 @@
 # Бот новостей об играх для Telegram + AI-видео
 
+![CI](https://github.com/deniskolzun13/game-news-bot-video/actions/workflows/ci.yml/badge.svg)
+![Coverage](https://codecov.io/gh/deniskolzun13/game-news-bot-video/branch/master/graph/badge.svg)
+![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+
 Парсит новости с русскоязычных игровых сайтов (StopGame, Igromania, DTF), переписывает их
 локальной LLM (Ollama) и публикует в Telegram-канал. Для каждой опубликованной
 новости дополнительно генерируется короткое вертикальное видео (9:16) с озвучкой

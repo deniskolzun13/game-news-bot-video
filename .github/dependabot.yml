@@ -1,0 +1,38 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "deps(pip)"
+    open-pull-requests-limit: 5
+    groups:
+      dev-dependencies:
+        patterns:
+          - "pytest*"
+          - "ruff*"
+          - "black*"
+          - "mypy*"
+        update-types:
+          - "minor"
+          - "patch"
+      production-dependencies:
+        patterns:
+          - "aiogram*"
+          - "httpx*"
+          - "beautifulsoup4*"
+          - "feedparser*"
+          - "pillow*"
+          - "python-dotenv*"
+          - "psutil*"
+          - "whisper*"
+          - "piper*"
+        update-types:
+          - "minor"
+          - "patch"
