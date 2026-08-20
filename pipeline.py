@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from article import fetch_article
+from article import ArticleContent, fetch_article, ParseResult
 from config import Config
 from images import (
     clean_image,
@@ -128,6 +128,43 @@ class NewsPipeline:
             if cfg.dry_run
             else TelegramPublisher(cfg.telegram_token, cfg.channel_id, cfg.max_caption_length)
         )
+        # Health-check парсеров: счётчики успехов/неудач по источникам
+        self._parse_stats: dict[str, dict] = {}
+
+    def _record_parse_result(self, result) -> None:
+        """Записывает результат парсинга для health-check."""
+        src = result.source
+        if src not in self._parse_stats:
+            self._parse_stats[src] = {"total": 0, "success": 0, "failures": []}
+        self._parse_stats[src]["total"] += 1
+        if result.success:
+            self._parse_stats[src]["success"] += 1
+        else:
+            self._parse_stats[src]["failures"].append({
+                "reason": result.reason.value if result.reason else "unknown",
+                "details": result.details,
+                "url": result.url,
+                "timestamp": result.timestamp.isoformat() if result.timestamp else None,
+            })
+            # Ограничиваем историю неудач
+            if len(self._parse_stats[src]["failures"]) > 50:
+                self._parse_stats[src]["failures"] = self._parse_stats[src]["failures"][-50:]
+
+    def _check_parser_health(self) -> list[str]:
+        """Возвращает список источников с низким % успеха (< 50%)."""
+        problematic = []
+        for src, stats in self._parse_stats.items():
+            if stats["total"] >= 5:  # Минимум 5 попыток для оценки
+                success_rate = stats["success"] / stats["total"]
+                if success_rate < 0.5:
+                    problematic.append(
+                        f"{src}: {success_rate:.0%} успеха ({stats['success']}/{stats['total']})"
+                    )
+        return problematic
+
+    def get_parse_stats(self) -> dict:
+        """Возвращает статистику парсинга для /health и мониторинга."""
+        return {src: dict(stats) for src, stats in self._parse_stats.items()}
 
     def _random_delay(self) -> timedelta:
         minutes = random.randint(
@@ -243,15 +280,24 @@ class NewsPipeline:
         (publish_one_now) публикации. Возвращает None, если новость не прошла
         хотя бы один этап (тогда она не публикуется вообще).
         """
-        article = await fetch_article(
+        article_result = await fetch_article(
             self._http, item.url, item.source, self._cfg.http_timeout
         )
-        article_text = article.text if article else ""
+        if not article_result.success or article_result.content is None:
+            log.warning("Парсинг не удался (%s): %s — %s",
+                        item.url, article_result.reason, article_result.details)
+            # Записываем статистику парсинга для health-check
+            self._record_parse_result(article_result)
+            return None
+        article = article_result.content
+        article_text = article.text
         if not article_text:
             article_text = item.description
         if not article_text:
             log.warning("Нет текста статьи, пропускаем: %s", item.url)
             return None
+        # Записываем успешный результат
+        self._record_parse_result(article_result)
 
         game = await self._game_name(model, item.title)
         if await self._is_duplicate(item, model, game):

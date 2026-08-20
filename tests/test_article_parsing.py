@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from article import ArticleContent, fetch_article
+from article import ArticleContent, fetch_article, ParseResult, ParseFailureReason
 
 
 class MockResponse:
@@ -43,13 +43,15 @@ async def test_fetch_article_stopgame():
     result = await fetch_article(
         client, "https://stopgame.ru/news/123", "stopgame", timeout=10.0
     )
-    assert result is not None, "Должен вернуть ArticleContent"
-    assert isinstance(result, ArticleContent)
-    assert "RetroSpace" in result.text
-    assert "1 октября" in result.text
-    assert result.og_image == "https://stopgame.ru/uploads/og_image.jpg"
-    assert len(result.content_images) >= 1
-    assert any("youtu.be/dQw4w9WgXcQ" in link for link in result.youtube_links)
+    assert result is not None, "Должен вернуть ParseResult"
+    assert isinstance(result.content, ArticleContent)
+    assert result.success is True
+    assert result.reason is None
+    assert "RetroSpace" in result.content.text
+    assert "1 октября" in result.content.text
+    assert result.content.og_image == "https://stopgame.ru/uploads/og_image.jpg"
+    assert len(result.content.content_images) >= 1
+    assert any("youtu.be/dQw4w9WgXcQ" in link for link in result.content.youtube_links)
 
 
 @pytest.mark.asyncio
@@ -60,11 +62,12 @@ async def test_fetch_article_igromania():
         client, "https://www.igromania.ru/news/456", "igromania", timeout=10.0
     )
     assert result is not None
-    assert "Крысиный Король" in result.text
-    assert "DLC со Слэшем" in result.text
-    assert result.og_image == "https://www.igromania.ru/uploads/og_igromania.jpg"
-    assert len(result.video_urls) >= 1
-    assert result.video_urls[0].endswith(".mp4")
+    assert result.success is True
+    assert "Крысиный Король" in result.content.text
+    assert "DLC со Слэшем" in result.content.text
+    assert result.content.og_image == "https://www.igromania.ru/uploads/og_igromania.jpg"
+    assert len(result.content.video_urls) >= 1
+    assert result.content.video_urls[0].endswith(".mp4")
 
 
 @pytest.mark.asyncio
@@ -75,10 +78,11 @@ async def test_fetch_article_dtf():
         client, "https://dtf.ru/games/789", "dtf", timeout=10.0
     )
     assert result is not None
-    assert "гротескного RPG" in result.text
-    assert "15 ноября" in result.text
-    assert result.og_image == "https://dtf.ru/og/dtf_og.jpg"
-    assert any("youtu.be/dQw4w9WgXcQ" in link for link in result.youtube_links)
+    assert result.success is True
+    assert "гротескного RPG" in result.content.text
+    assert "15 ноября" in result.content.text
+    assert result.content.og_image == "https://dtf.ru/og/dtf_og.jpg"
+    assert any("youtu.be/dQw4w9WgXcQ" in link for link in result.content.youtube_links)
 
 
 @pytest.mark.asyncio
@@ -89,11 +93,12 @@ async def test_fetch_article_3dnews():
         client, "https://3dnews.ru/games/999", "3dnews", timeout=10.0
     )
     assert result is not None
-    assert "Nightdive Studios" in result.text
-    assert "24 сентября" in result.text
-    assert result.og_image == "https://3dnews.ru/og/3dnews_og.jpg"
-    assert len(result.video_urls) >= 1
-    assert result.video_urls[0].endswith(".webm")
+    assert result.success is True
+    assert "Nightdive Studios" in result.content.text
+    assert "24 сентября" in result.content.text
+    assert result.content.og_image == "https://3dnews.ru/og/3dnews_og.jpg"
+    assert len(result.content.video_urls) >= 1
+    assert result.content.video_urls[0].endswith(".webm")
 
 
 @pytest.mark.asyncio
@@ -103,7 +108,9 @@ async def test_fetch_article_vgtimes():
     result = await fetch_article(
         client, "https://vgtimes.ru/article/111", "vgtimes", timeout=10.0
     )
-    assert result is None
+    assert result is not None
+    assert result.success is False
+    assert result.reason == ParseFailureReason.NO_SELECTOR
 
 
 @pytest.mark.asyncio
@@ -113,7 +120,9 @@ async def test_fetch_article_page_unavailable():
     result = await fetch_article(
         client, "https://stopgame.ru/news/404", "stopgame", timeout=10.0
     )
-    assert result is None, "При 404 должен вернуть None, не падать"
+    assert result is not None
+    assert result.success is False
+    assert result.reason == ParseFailureReason.NETWORK_ERROR
 
 
 @pytest.mark.asyncio
@@ -130,7 +139,37 @@ async def test_fetch_article_selector_not_found():
     result = await fetch_article(
         client, "https://stopgame.ru/news/bad", "stopgame", timeout=10.0
     )
-    assert result is None
+    assert result is not None
+    assert result.success is False
+    assert result.reason == ParseFailureReason.SELECTOR_NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_fetch_article_fallback_used():
+    """Фолбэк срабатывает когда селектор не найден, но есть текст в body."""
+    html = """
+    <html><body>
+    <div class="wrong-container">Короткий текст</div>
+    <article>
+    <p>Это достаточно длинный текст статьи, который должен быть извлечен фолбэком.
+    Он содержит достаточно слов для прохождения минимального порога в 200 символов.
+    Текст описывает важную новость об игре, которую мы хотим извлечь.</p>
+    </article>
+    </body></html>
+    """
+    client = MockClient()
+    client.fixture_name = None
+
+    async def mock_get(*args, **kwargs):
+        return MockResponse(html)
+
+    client.get = mock_get
+    result = await fetch_article(
+        client, "https://stopgame.ru/news/fallback", "stopgame", timeout=10.0
+    )
+    assert result is not None
+    assert result.success is True
+    assert "фолбэк" in result.details.lower() or result.text_length > 100
 
 
 if __name__ == "__main__":
