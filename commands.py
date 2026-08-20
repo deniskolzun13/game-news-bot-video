@@ -21,7 +21,7 @@ from aiogram.types import (
     Update,
 )
 
-from owner import load_owner, save_owner
+from owner import load_owner, save_owner, verify_setup_code, generate_setup_code, transfer_ownership, log_auth_attempt, is_owner
 from pipeline import NewsPipeline
 from storage import Storage
 from video_pipeline import VideoPipeline
@@ -111,18 +111,33 @@ class CommandLoop:
         if not msg or msg.chat.type != "private" or not msg.text:
             return
         if self._owner_id is None:
+            # Попытка верификации через код настройки
+            parts = msg.text.strip().split()
+            if len(parts) == 2 and parts[0] == "/start":
+                input_code = parts[1]
+                if verify_setup_code(self._cfg.db_path, input_code):
+                    self._owner_id = msg.chat.id
+                    save_owner(self._cfg.db_path, msg.chat.id)
+                    log_auth_attempt(msg.chat.id, True, "setup_code")
+                    await self._send(msg.chat.id, "Ты теперь владелец бота.")
+                    await self._send(msg.chat.id, "Управление ботом:", keyboard=PANEL)
+                    return
+                else:
+                    log_auth_attempt(msg.chat.id, False, "invalid_setup_code")
+            # Старый способ через OWNER_SETUP_CODE (для совместимости)
             setup_code = self._cfg.owner_setup_code
-            if not setup_code or msg.text.strip() != f"/start {setup_code}":
-                await self._send(
-                    msg.chat.id,
-                    "Владелец ещё не настроен. Укажите OWNER_CHAT_ID или "
-                    "OWNER_SETUP_CODE и отправьте /start <код>.",
-                )
+            if setup_code and msg.text.strip() == f"/start {setup_code}":
+                self._owner_id = msg.chat.id
+                save_owner(self._cfg.db_path, msg.chat.id)
+                log_auth_attempt(msg.chat.id, True, "legacy_setup_code")
+                await self._send(msg.chat.id, "Ты теперь владелец бота.")
+                await self._send(msg.chat.id, "Управление ботом:", keyboard=PANEL)
                 return
-            self._owner_id = msg.chat.id
-            save_owner(self._cfg.db_path, msg.chat.id)
-            await self._send(msg.chat.id, "Ты теперь владелец бота.")
-            await self._send(msg.chat.id, "Управление ботом:", keyboard=PANEL)
+            await self._send(
+                msg.chat.id,
+                "Владелец ещё не настроен. Укажите OWNER_CHAT_ID или "
+                "OWNER_SETUP_CODE и отправьте /start <код>.",
+            )
             return
         if msg.chat.id != self._owner_id:
             return
@@ -171,6 +186,8 @@ class CommandLoop:
             await self._send(msg.chat.id, await self._cmd_status())
         elif cmd == "/settings":
             await self._send(msg.chat.id, await self._cmd_settings())
+        elif cmd == "/transfer_ownership":
+            await self._send(msg.chat.id, await self._cmd_transfer_ownership(parts))
         elif cmd in ("/help", "/start"):
             await self._send(msg.chat.id, HELP_TEXT)
             await self._send(msg.chat.id, "Управление ботом:", keyboard=PANEL)
@@ -365,6 +382,20 @@ class CommandLoop:
             f"Сбор: каждые {cfg.poll_interval_minutes} мин",
         ]
         return "\n".join(lines)
+
+    async def _cmd_transfer_ownership(self, parts: list[str]) -> str:
+        """Смена владельца: /transfer_ownership <chat_id>."""
+        if len(parts) < 2 or not parts[1].isdigit():
+            return "Использование: /transfer_ownership <chat_id>"
+        new_owner_id = int(parts[1])
+        if new_owner_id == self._owner_id:
+            return "Вы уже владелец."
+        ok = transfer_ownership(self._cfg.db_path, self._owner_id, new_owner_id)
+        if ok:
+            self._owner_id = new_owner_id
+            log_auth_attempt(new_owner_id, True, "ownership_transfer")
+            return f"✅ Владелец изменён на {new_owner_id}."
+        return "❌ Ошибка: вы не являетесь текущим владельцем."
 
     async def _send_queue(self, chat_id: int) -> None:
         rows = self._pipeline.queue_items()
