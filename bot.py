@@ -9,7 +9,8 @@ import argparse
 import asyncio
 import logging
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 
 # На части сетей IPv6 к api.telegram.org не работает и вешает запросы —
 # форсируем IPv4 для aiohttp (aiogram/Telegram API).
@@ -25,6 +26,7 @@ from video_pipeline import VideoPipeline
 log = logging.getLogger("bot")
 
 TICK_SECONDS = 30
+WATCHDOG_FILE = "watchdog.tmp"  # файл-метка для внешнего watchdog'а
 
 
 async def run_once(pipeline: NewsPipeline) -> None:
@@ -118,6 +120,8 @@ async def main() -> None:
             cfg.min_post_delay_minutes,
             cfg.max_post_delay_minutes,
         )
+        # Проверка пропущенных слотов публикации после перезапуска
+        await _check_and_publish_missed_slots(pipeline, notifier)
         backup = pipeline.backup()
         if backup:
             log.info("Бэкап БД: %s", backup)
@@ -134,9 +138,13 @@ async def main() -> None:
             tick = 0
             review_done_today = set()  # часы ревью, уже выполненные сегодня
             last_day = None
+            # Инициализируем watchdog файл
+            _update_watchdog()
             while True:
                 tick += 1
                 now = datetime.now()
+                # Обновляем watchdog файл на каждом тике
+                _update_watchdog()
                 # Сброс множества ревью в полночь
                 if last_day is not None and now.date() != last_day:
                     review_done_today.clear()
@@ -184,6 +192,57 @@ async def main() -> None:
             await video_pipeline.close()
         if notifier:
             await notifier.close()
+
+
+def _update_watchdog() -> None:
+    """Обновляет файл-метку watchdog для внешнего мониторинга.
+
+    Внешний watchdog (systemd WatchdogSec, или отдельный скрипт)
+    может проверять время модификации этого файла.
+    """
+    try:
+        Path(WATCHDOG_FILE).write_text(str(time.time()))
+    except Exception:
+        pass  # не критично
+
+
+async def _check_and_publish_missed_slots(pipeline: NewsPipeline, notifier) -> None:
+    """Проверяет и публикует пропущенные слоты после перезапуска.
+
+    При перезапуске бота некоторые посты могли не успеть опубликоваться
+    в свои слоты. Эта функция находит такие посты и публикует их.
+    """
+    try:
+        storage = pipeline._storage
+        now = datetime.now()
+        due = storage.due_items(now)
+        missed = [row for row in due if row["status"] not in ("awaiting", "awaiting_review")]
+        if missed:
+            log.info("Найдено пропущенных постов после перезапуска: %d", len(missed))
+            for row in missed:
+                if row["status"] == "awaiting_review":
+                    continue
+                fresh = True
+                if row.get("created_at"):
+                    try:
+                        created = datetime.fromisoformat(row["created_at"])
+                        if datetime.now() - created > timedelta(hours=pipeline._cfg.news_freshness_hours):
+                            fresh = False
+                    except ValueError:
+                        pass
+                if not fresh:
+                    log.info("Пропущен устаревший пост #%d: %s", row["id"], row["url"])
+                    storage.dequeue(row["id"])
+                    continue
+                try:
+                    await pipeline.publish_due(force=True)
+                    log.info("Принудительно опубликован пост #%d", row["id"])
+                    if notifier:
+                        await notifier.notify("missed_slot", f"Опубликован пропущенный пост #{row['id']}")
+                except Exception:
+                    log.exception("Ошибка публикации пропущенного поста #%d", row["id"])
+    except Exception:
+        log.exception("Ошибка проверки пропущенных слотов")
 
 
 if __name__ == "__main__":
