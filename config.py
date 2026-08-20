@@ -311,3 +311,59 @@ def _validate(cfg: Config) -> None:
             raise SystemExit("Ошибка конфигурации: часы в REVIEW_TIMES должны быть от 0 до 23.")
         if cfg.review_window_hours < 1:
             raise SystemExit("Ошибка конфигурации: REVIEW_WINDOW_HOURS должен быть не меньше 1.")
+
+    # --- Проверка credentials при старте ---
+    _validate_credentials(cfg)
+
+
+def _validate_credentials(cfg: Config) -> None:
+    """Проверяет наличие и валидность credentials при старте (не в dry-run)."""
+    from pathlib import Path
+
+    # Google Drive
+    if cfg.upload_to_drive and not cfg.dry_run:
+        creds_path = Path(cfg.drive_credentials_file)
+        if not creds_path.exists():
+            raise SystemExit(
+                "Ошибка конфигурации: UPLOAD_TO_DRIVE=true, но не найден "
+                f"файл credentials.json ({creds_path}). Положите него в корень проекта "
+                "или укажите путь в GOOGLE_CREDENTIALS_FILE. Подробности — в README."
+            )
+        # Проверяем, что это валидный JSON
+        try:
+            import json
+            json.loads(creds_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SystemExit(
+                f"Ошибка конфигурации: credentials.json невалиден: {exc}"
+            )
+
+    # Piper TTS модель
+    if cfg.video_enabled and cfg.tts_engine in ("piper", "auto") and not cfg.dry_run:
+        model_path = Path(cfg.piper_model_path)
+        config_path = Path(cfg.piper_config_path)
+        if not model_path.exists():
+            raise SystemExit(
+                f"Ошибка конфигурации: модель Piper не найдена: {model_path}. "
+                "Скачайте ru_RU-irina-medium.onnx в assets/piper/ (см. README)."
+            )
+        if not config_path.exists():
+            log.warning("Конфиг Piper не найден: %s (используются дефолтные настройки)", config_path)
+
+    # API ключи (предупреждения, не фатальные ошибки)
+    if cfg.video_enabled and not cfg.dry_run:
+        if cfg.pixabay_api_key is None:
+            log.warning("PIXABAY_API_KEY не задан — поиск фото через Pixabay отключен")
+        if cfg.steamgriddb_api_key is None:
+            log.warning("STEAMGRIDDB_API_KEY не задан — поиск обложек SteamGridDB отключен")
+
+    # LLM fallback
+    if cfg.video_enabled and not cfg.dry_run:
+        fallback_enabled = os.getenv("LLM_FALLBACK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+        if fallback_enabled:
+            if not os.getenv("LLM_FALLBACK_BASE_URL", "").strip():
+                log.warning("LLM_FALLBACK_ENABLED=true, но LLM_FALLBACK_BASE_URL не задан")
+            if not os.getenv("LLM_FALLBACK_API_KEY", "").strip():
+                log.warning("LLM_FALLBACK_ENABLED=true, но LLM_FALLBACK_API_KEY не задан")
+            if not os.getenv("LLM_FALLBACK_MODEL", "").strip():
+                log.warning("LLM_FALLBACK_ENABLED=true, но LLM_FALLBACK_MODEL не задан")
